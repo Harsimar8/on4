@@ -85,6 +85,54 @@ const TERRAIN_SAMPLE_SPACING_M = 5;
 const EARTH_RADIUS_M = 6371000;
 const BLOCKED_POINT_ALWAYS_VISIBLE_M = 3000;
 
+// The beam panel between two neighbouring ray end points is a straight chord,
+// while the terrain between them bulges above and dips below it. Moving each
+// vertex toward the eye along its view ray changes only its depth, not where it
+// lands on screen, so the beam wins against terrain close behind it but is still
+// hidden by ridges clearly in front.
+//
+// How far the terrain strays from a panel depends on how wide the panel is, and
+// that grows with distance from the radar (width = range * azimuth step), not
+// with camera distance. So the pull is set per vertex from its range to the
+// radar, and zooming in no longer lets the terrain cut back through the beam.
+const BEAM_DEPTH_PULL_PER_PANEL_WIDTH = 0.5;
+const BEAM_DEPTH_PULL_MIN_M = 10.0;
+// Never pull a vertex more than this fraction of the way to the camera.
+const BEAM_DEPTH_PULL_MAX_CAMERA_FRACTION = 0.8;
+
+const buildBeamVS = (pullPerRangeM: number) => `
+in vec3 position3DHigh;
+in vec3 position3DLow;
+in float rangeFromRadar;
+in vec4 color;
+in float batchId;
+
+out vec4 v_color;
+
+void main()
+{
+    vec4 p = czm_computePosition();
+    vec4 positionEC = czm_modelViewRelativeToEye * p;
+
+    float dist = length(positionEC.xyz);
+    float pull = ${BEAM_DEPTH_PULL_MIN_M.toFixed(1)} + rangeFromRadar * ${pullPerRangeM.toFixed(5)};
+    pull = min(pull, dist * ${BEAM_DEPTH_PULL_MAX_CAMERA_FRACTION.toFixed(2)});
+    positionEC.xyz *= (dist - pull) / max(dist, 0.001);
+
+    v_color = color;
+    gl_Position = czm_projection * positionEC;
+}
+`;
+
+const BEAM_FS = `
+in vec4 v_color;
+
+void main()
+{
+    out_FragColor = czm_gammaCorrect(v_color);
+}
+`;
+
 export class CesiumRadarCoverage {
     public static readonly DEFAULT_3D_ZONES: RadarZoneConfig[] = [
         {
@@ -490,11 +538,13 @@ export class CesiumRadarCoverage {
 
         const fullCircle = zone.azimuthWidthDeg >= 360;
         const positions: number[] = [];
+        const ranges: number[] = [];
         const indices: number[] = [];
         const boundingPoints: Cesium.Cartesian3[] = [radarPosition];
 
         const apexIdx = 0;
         positions.push(radarPosition.x, radarPosition.y, radarPosition.z);
+        ranges.push(0);
 
         const tanEls = zone.rayElevationsDeg.map(el => Math.tan(Cesium.Math.toRadians(el)));
         const scratchLocal = new Cesium.Cartesian3();
@@ -511,6 +561,7 @@ export class CesiumRadarCoverage {
                 scratchLocal.z = d * tanEls[k];
                 const world = Cesium.Matrix4.multiplyByPoint(enuMatrix, scratchLocal, new Cesium.Cartesian3());
                 positions.push(world.x, world.y, world.z);
+                ranges.push(d);
                 boundingPoints.push(world);
             }
         }
@@ -548,13 +599,23 @@ export class CesiumRadarCoverage {
                     componentDatatype: Cesium.ComponentDatatype.DOUBLE,
                     componentsPerAttribute: 3,
                     values: new Float64Array(positions)
+                }),
+                // Read by the beam vertex shader to size its depth pull.
+                rangeFromRadar: new Cesium.GeometryAttribute({
+                    componentDatatype: Cesium.ComponentDatatype.FLOAT,
+                    componentsPerAttribute: 1,
+                    values: new Float32Array(ranges)
                 })
             } as unknown) as Cesium.GeometryAttributes,
             indices: new Uint32Array(indices),
             boundingSphere: Cesium.BoundingSphere.fromPoints(boundingPoints)
         });
 
-        Cesium.GeometryPipeline.computeNormal(geometry);
+        // Panel width per metre of range is the azimuth step in radians.
+        const azimuthStepRad = Cesium.Math.toRadians(
+            Math.min(zone.azimuthWidthDeg, 360) / Math.max(1, fullCircle ? numAzimuths : numAzimuths - 1)
+        );
+        const pullPerRangeM = azimuthStepRad * BEAM_DEPTH_PULL_PER_PANEL_WIDTH;
 
         const primitive = new Cesium.Primitive({
             geometryInstances: new Cesium.GeometryInstance({
@@ -569,9 +630,15 @@ export class CesiumRadarCoverage {
             // Depth test on so the terrain in front hides the beam. With it off the
             // beam was painted over the terrain and appeared to float and slide
             // across the hills whenever the camera moved.
+            // Flat (unlit) so every panel has the same shade, and the vertex shader
+            // pulls depth toward the camera so panels lying on the hillside are not
+            // cut into patches by the terrain between two ray end points.
             appearance: new Cesium.PerInstanceColorAppearance({
                 translucent: true,
                 closed: false,
+                flat: true,
+                vertexShaderSource: buildBeamVS(pullPerRangeM),
+                fragmentShaderSource: BEAM_FS,
                 renderState: {
                     depthTest: { enabled: true },
                     depthMask: false
