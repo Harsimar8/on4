@@ -15,30 +15,44 @@ export class CesiumSelection {
         click: Cesium.ScreenSpaceEventHandler.PositionedEvent
     ): void {
 
-        const picked = this.viewer.scene.pick(click.position);
+        // drillPick so a click anywhere on the radar - beam volume, blocked-point
+        // dots or emitter marker - still selects it when something else is on top.
+        const pickedList = this.viewer.scene.drillPick(click.position);
 
-        if (!Cesium.defined(picked)) {
+        if (pickedList.length === 0) {
             this.editorState.selectedEntity.set(null);
             return;
         }
 
-        const pickedEntity = (picked as any).id;
+        const entities = this.entityRepository.all();
 
-        if (!pickedEntity) {
-            return;
+        for (const picked of pickedList) {
+
+            const targetId = this.resolveTargetId((picked as any).id);
+
+            const entity = targetId
+                ? entities.find(e => e.id === targetId)
+                : undefined;
+
+            if (entity) {
+                this.editorState.selectedEntity.set(entity);
+                return;
+            }
+        }
+    }
+
+    // The radar beam volume is a Primitive whose pick id is the radar's id
+    // string; markers and dots are Entities tagged with radarParentId.
+    private resolveTargetId(pickedId: any): string | undefined {
+
+        if (!pickedId) {
+            return undefined;
         }
 
-        // If a 3D radar wall, cap, or ray was clicked, select its parent radar entity
-        const targetId = pickedEntity.radarParentId || pickedEntity.id;
-
-        const entity = this.entityRepository
-            .all()
-            .find(e => e.id === targetId);
-
-        if (!entity) {
-            return;
+        if (typeof pickedId === "string") {
+            return pickedId;
         }
 
-        this.editorState.selectedEntity.set(entity);
+        return pickedId.radarParentId || pickedId.id;
     }
 }

@@ -258,16 +258,21 @@ export class CesiumRadarCoverage {
 
             if (showBlockedPoints) {
                 stops.forEach((rayStops, a) => {
-                    for (const stop of rayStops) {
-                        if (stop.blockIndex < 0) continue;
+                    const azRad = Cesium.Math.toRadians(azimuthsDeg[a]);
+                    rayStops.forEach((stop, k) => {
+                        if (stop.blockIndex < 0) return;
                         const key = `${fanKey}|${a}|${stop.blockIndex}`;
-                        if (blockedPoints.has(key)) continue;
-                        const ground = profiles[a].groundPoints[stop.blockIndex];
+                        if (blockedPoints.has(key)) return;
+                        // Same end point the beam mesh uses for this ray, so the dot
+                        // sits exactly on the beam's edge instead of on re-clamped terrain.
+                        const d = stop.horizontalDistance;
+                        const tanEl = Math.tan(Cesium.Math.toRadians(zone.rayElevationsDeg[k]));
+                        const local = new Cesium.Cartesian3(Math.sin(azRad) * d, Math.cos(azRad) * d, d * tanEl);
                         blockedPoints.set(key, {
-                            position: Cesium.Cartesian3.fromRadians(ground.longitude, ground.latitude, 10),
+                            position: Cesium.Matrix4.multiplyByPoint(enuMatrix, local, new Cesium.Cartesian3()),
                             color: zone.color
                         });
-                    }
+                    });
                 });
             }
 
@@ -287,10 +292,10 @@ export class CesiumRadarCoverage {
         }
 
         if (blockedPoints.size > 0) {
-            // Depth-tested and placed relative to the rendered terrain: a marker behind
-            // a ridge is hidden by it instead of being painted onto the ridge's near
-            // face, and it follows the drawn ground at every LOD. The 10 m lift keeps
-            // it from sinking half into the slope it sits on.
+            // Fixed world positions at each blocked ray's end point. Clamping them to
+            // terrain made them slide against the beam whenever the camera moved.
+            // Depth-tested beyond BLOCKED_POINT_ALWAYS_VISIBLE_M so ridges in front
+            // hide them; closer than that the slope they sit on would hide them.
             const pointEntities: Cesium.Entity[] = [];
             viewer.entities.suspendEvents();
             for (const { position, color } of blockedPoints.values()) {
@@ -301,10 +306,7 @@ export class CesiumRadarCoverage {
                         color,
                         outlineColor: Cesium.Color.WHITE,
                         outlineWidth: 2,
-                        heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
-                        // Up close the marker's own slope would hide it, so skip the
-                        // depth test within this camera distance. Further out it stays
-                        // depth-tested and ridges in front still hide it.
+                        heightReference: Cesium.HeightReference.NONE,
                         disableDepthTestDistance: BLOCKED_POINT_ALWAYS_VISIBLE_M
                     }
                 });
@@ -430,20 +432,38 @@ export class CesiumRadarCoverage {
         const tanEl = Math.tan(elevationRad);
         const maxHorizontal = slantRange * Math.cos(elevationRad);
 
+        // Height of the ray above the ground at sample i. The ray is a straight line
+        // in the radar's local tangent frame, while the Earth curves away beneath it
+        // by ~d^2/2R, so the ground is lowered by that much to match the drawn volume.
+        const clearance = (i: number): number => {
+            const dist = horizontalDistances[i];
+            const curvatureDrop = (dist * dist) / (2 * EARTH_RADIUS_M);
+            return radarHeight + dist * tanEl - (groundHeights[i] - curvatureDrop);
+        };
+
+        let prevClearance = clearance(0);
+
         for (let i = 1; i < horizontalDistances.length; i++) {
             const dist = horizontalDistances[i];
             if (dist > maxHorizontal) break;
 
-            // The ray is a straight line in the radar's local tangent frame, while
-            // the Earth curves away beneath it by ~d^2/2R. Compare the ground against
-            // that straight line so the check agrees with the drawn volume.
-            const curvatureDrop = (dist * dist) / (2 * EARTH_RADIUS_M);
-            const groundH = groundHeights[i] - curvatureDrop;
-            const rayH = radarHeight + dist * tanEl;
+            const currClearance = clearance(i);
 
-            if (groundH > rayH) {
-                return { horizontalDistance: dist, blockIndex: i };
+            if (currClearance < 0) {
+                // The ray went under the ground between samples i-1 and i. Interpolate
+                // the exact crossing so the ray ends on the terrain surface rather
+                // than up to one sample spacing inside the hill.
+                const prevDist = horizontalDistances[i - 1];
+                const t = prevClearance > 0
+                    ? prevClearance / (prevClearance - currClearance)
+                    : 0;
+                return {
+                    horizontalDistance: prevDist + t * (dist - prevDist),
+                    blockIndex: i
+                };
             }
+
+            prevClearance = currClearance;
         }
         return { horizontalDistance: maxHorizontal, blockIndex: -1 };
     }
@@ -452,8 +472,9 @@ export class CesiumRadarCoverage {
     // 6. Volumetric Mesh Primitive Builder: buildRadarVolumePrimitive
     // -------------------------------------------------------------------
     // The outer surface joins every ray's end point to its neighbours (next
-    // azimuth, next elevation). The lowest and highest rays are closed back to
-    // the radar with fans, and so are the two sector edges when the sweep is < 360.
+    // azimuth, next elevation). The highest rays are closed back to the radar
+    // with a fan, and so are the two sector edges when the sweep is < 360. There
+    // is no floor fan, so no footprint is drawn on the ground.
     private static buildRadarVolumePrimitive(
         viewer: Cesium.Viewer,
         radarPosition: Cesium.Cartesian3,
@@ -507,8 +528,9 @@ export class CesiumRadarCoverage {
                 indices.push(v(a, k), v(a2, k + 1), v(a, k + 1));
             }
 
-            // Lowest and highest rays back to the radar
-            indices.push(apexIdx, v(a, 0), v(a2, 0));
+            // Highest rays back to the radar. The lowest rays are not closed back:
+            // that floor lay along the ground and drew a blotchy footprint wherever
+            // the terrain cut through it.
             indices.push(apexIdx, v(a2, numRays - 1), v(a, numRays - 1));
         }
 
@@ -544,15 +566,14 @@ export class CesiumRadarCoverage {
             }),
             // closed: false disables back-face culling. With it on, faces vanished
             // whenever the camera zoomed close to or inside the volume.
-            // Depth test off: the surface between two ray end points is a flat panel,
-            // and rendered terrain poking through it looked like the radar was blocked
-            // there. Real blocking is already in each ray's end point, so the beam is
-            // drawn whole, on top of the terrain.
+            // Depth test on so the terrain in front hides the beam. With it off the
+            // beam was painted over the terrain and appeared to float and slide
+            // across the hills whenever the camera moved.
             appearance: new Cesium.PerInstanceColorAppearance({
                 translucent: true,
                 closed: false,
                 renderState: {
-                    depthTest: { enabled: false },
+                    depthTest: { enabled: true },
                     depthMask: false
                 }
             }),
