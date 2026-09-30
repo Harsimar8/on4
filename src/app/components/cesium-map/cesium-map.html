@@ -91,6 +91,14 @@
           <span>Show Terrain Blocking Points</span>
         </label>
 
+        <label class="checkbox-field"
+          title="Click anywhere on the map to see why this radar does or doesn't cover that spot">
+          <input type="checkbox"
+            [checked]="getRadarProp('explainOnClick', false)"
+            (change)="onExplainOnClickChange($any($event.target).checked)">
+          <span>Explain Coverage on Click</span>
+        </label>
+
         <div class="beam-control">
 
   <div class="beam-control__header">

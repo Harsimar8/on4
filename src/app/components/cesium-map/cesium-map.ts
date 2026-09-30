@@ -11,7 +11,8 @@ import {
 
 import * as Cesium from 'cesium';
 import { CommonModule } from '@angular/common';
-import { CesiumRadarCoverage } from './CesiumRadarCoverage';
+import { BeamHit, CesiumRadarCoverage } from './CesiumRadarCoverage';
+import { CesiumCoverageExplainer } from './CesiumCoverageExplainer';
 import { CesiumPlacement } from './CesiumPlacement';
 import { CesiumEntityRenderer } from "./CesiumEntityRenderer";
 import { CesiumHover } from "./CesiumHover";
@@ -133,6 +134,9 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
   private placement!: CesiumPlacement;
   private hover!: CesiumHover;
   private selection!: CesiumSelection;
+  private coverageExplainer?: CesiumCoverageExplainer;
+  // Bumped per explain click, so a slow terrain lookup can't overwrite a newer one.
+  private explainRequest = 0;
   private objectDetector!: CesiumObjectDetector;
   protected readonly TeamFilter = TeamFilter;
 
@@ -245,6 +249,8 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
       this.entityRepository
 
     );
+
+    this.coverageExplainer = new CesiumCoverageExplainer(this.viewer);
 
     this.selection = new CesiumSelection(
 
@@ -532,6 +538,13 @@ onInteriorToggle(checked: boolean): void {
     this.updateRadarProperty({ showBlockedPoints: checked });
   }
 
+  onExplainOnClickChange(checked: boolean): void {
+    this.updateRadarProperty({ explainOnClick: checked });
+    if (!checked) {
+      this.clearCoverageInfo();
+    }
+  }
+
   toggleDrawRays(): void {
     this.onDrawRaysChange(!this.getRadarProp('drawRays', false));
   }
@@ -649,6 +662,10 @@ onInteriorToggle(checked: boolean): void {
       console.log("Height:", height);
     }
 
+    if (!this.editorState.placementMode() && this.tryExplainCoverage(click)) {
+      return;
+    }
+
     if (this.editorState.placementMode()) {
 
       this.placement.placeEntity(click);
@@ -657,7 +674,130 @@ onInteriorToggle(checked: boolean): void {
 
       this.selection.selectEntity(click);
 
+      // Selecting the same radar again doesn't change the selection, so the
+      // panel effect doesn't fire; reopen the panel if it was closed.
+      if (this.editorState.selectedEntity()?.definition?.entityType === 'RadarSite') {
+        this.radarPanelClosed.set(false);
+      }
+
     }
+  }
+
+  /**
+   * While any radar has "Explain Coverage on Click" on, a click on the map
+   * reports why that radar does or doesn't reach the spot, instead of changing
+   * the selection. It keeps working with the radar panel closed. Clicking a
+   * different entity still selects it.
+   */
+  private tryExplainCoverage(
+    click: Cesium.ScreenSpaceEventHandler.PositionedEvent
+  ): boolean {
+
+    const entities = this.entityRepository.all();
+    const radars = entities.filter(e =>
+      e.definition.entityType === 'RadarSite' &&
+      (e.definition.properties as any)?.explainOnClick
+    );
+
+    if (radars.length === 0) {
+      return false;
+    }
+
+    // The beam volume is a primitive picked as the radar's id string; the radar
+    // itself and other placed things are Cesium entities. Clicking an entity
+    // (the radar marker included) selects it as usual, so its panel opens.
+    const pickedId = this.viewer.scene.pick(click.position)?.id;
+
+    if (pickedId && typeof pickedId !== 'string') {
+      const id = pickedId.radarParentId ?? pickedId.id;
+      if (entities.some(e => e.id === id)) {
+        return false;
+      }
+    }
+
+    // The beam of a radar that has the option off: select that radar.
+    if (
+      typeof pickedId === 'string' &&
+      !radars.some(r => r.id === pickedId) &&
+      entities.some(e => e.id === pickedId)
+    ) {
+      return false;
+    }
+
+    const ray = this.viewer.camera.getPickRay(click.position);
+    const ground = this.viewer.scene.pickPosition(click.position);
+
+    if (!ray) {
+      return false;
+    }
+
+    // Did the click pass through a drawn beam before reaching the ground (or,
+    // clicking the sky, within 100 km)? The nearest beam entry wins.
+    const rayEnd = ground ?? Cesium.Ray.getPoint(ray, 100000);
+    let airHit: { radarId: string; hit: BeamHit; distance: number } | undefined;
+
+    for (const radar of radars) {
+      const hit = CesiumRadarCoverage.findBeamEntry(radar.id, ray.origin, rayEnd);
+      if (hit) {
+        const distance = Cesium.Cartesian3.distance(ray.origin, hit.position);
+        if (!airHit || distance < airHit.distance) {
+          airHit = { radarId: radar.id, hit, distance };
+        }
+      }
+    }
+
+    let radarId: string;
+    let target: Cesium.Cartesian3;
+
+    if (airHit) {
+      radarId = airHit.radarId;
+      target = airHit.hit.position;
+    } else if (Cesium.defined(ground)) {
+      // Ground click: prefer the selected radar, otherwise the nearest one.
+      const selectedId = this.editorState.selectedEntity()?.id;
+      const distanceTo = (e: typeof radars[number]) => Cesium.Cartesian3.distance(
+        ground,
+        Cesium.Cartesian3.fromDegrees(e.position.longitude, e.position.latitude)
+      );
+      radarId = (
+        radars.find(r => r.id === selectedId)
+        ?? radars.reduce((best, r) => distanceTo(r) < distanceTo(best) ? r : best)
+      ).id;
+      target = ground;
+    } else {
+      return false;
+    }
+
+    const request = ++this.explainRequest;
+    this.coverageExplainer?.showMessage(target, 'Checking the terrain…');
+
+    CesiumRadarCoverage.explainPoint(radarId, target, airHit?.hit)
+      .then(explanation => {
+        if (request !== this.explainRequest) {
+          return;
+        }
+        if (explanation) {
+          this.coverageExplainer?.show(explanation);
+        } else {
+          this.coverageExplainer?.showMessage(
+            target,
+            'Coverage is still being built, or all zones are hidden'
+          );
+        }
+      })
+      .catch(err => {
+        console.error('Failed to explain coverage:', err);
+        if (request === this.explainRequest) {
+          this.coverageExplainer?.showMessage(target, 'Could not read the terrain here');
+        }
+      });
+
+    return true;
+  }
+
+  clearCoverageInfo(): void {
+    this.explainRequest++;
+    this.coverageExplainer?.clear();
   }
 
   public resize(): void {
